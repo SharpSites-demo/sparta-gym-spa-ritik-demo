@@ -1,0 +1,73 @@
+name: Publish exact reviewed HTML
+on:
+  workflow_call:
+    inputs:
+      expected_sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Verify source, back up current site, publish exact file
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          import os, re, json, base64, lzma, hashlib, urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+          repo = os.environ['GH_REPO']
+          assert repo.lower().startswith('sharpsites-demo/'), 'Organization-only publisher'
+          key = repo.split('/', 1)[1].lower()
+          expected = os.environ['EXPECTED_SHA256']
+          assert re.fullmatch(r'[a-f0-9]{64}', expected), 'Invalid expected digest'
+          source_root = 'https://raw.githubusercontent.com/SharpSites-demo/sparta-gym-spa-ritik-demo/ad7b1d5ed6c101695e6ae5cb1e70554eef64e44e/.publishing/reviewed-sites/'
+          def download_part(number):
+              with urllib.request.urlopen(source_root + f'part-{number:02d}.b64', timeout=40) as response:
+                  return response.read()
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              encoded = b''.join(pool.map(download_part, range(1, 13)))
+          assert len(encoded) == 69020, 'Incomplete source transport'
+          assert hashlib.sha256(encoded).hexdigest() == 'c0c3bb69f80435fc18cbb110bba7c0f37c57cc8c48470067601f6c5c5a83dfc2', 'Source transport digest mismatch'
+          compressed = base64.b64decode(encoded, validate=True)
+          assert hashlib.sha256(compressed).hexdigest() == '15ba6b5f5d15374362328608ec8724f1e4216166e1372f4a741be70332900eb9', 'Compressed source digest mismatch'
+          websites = json.loads(lzma.decompress(compressed, memlimit=512*1024*1024))
+          assert len(websites) == 90 and key in websites, 'Unexpected website inventory'
+          content = websites[key].encode('utf-8')
+          assert hashlib.sha256(content).hexdigest() == expected, 'Reviewed HTML digest mismatch'
+          canonical = 'https://sharpsites-demo.github.io/' + key + '/'
+          assert canonical.encode() in content, 'Wrong canonical destination'
+          assert b'ritik-sharma1.github.io' not in content.lower(), 'Personal-host dependency forbidden'
+          assert b'Made with ' in content and b'by SharpSites' in content, 'Footer absent'
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'SharpSites-reviewed-file-publisher'}
+          def api(method, path, data=None):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path, method=method, headers=headers, data=None if data is None else json.dumps(data).encode())
+              try:
+                  with urllib.request.urlopen(request, timeout=40) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as exc:
+                  raise RuntimeError(f'GitHub {method} failed with HTTP {exc.code}; no permission or conflict bypass attempted') from None
+          current = api('GET', '/contents/index.html?ref=gh-pages')
+          old_content = base64.b64decode(current['content'])
+          old_sha = current['sha']
+          desired_blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+          if old_sha == desired_blob:
+              print('ALREADY_PUBLISHED', repo, expected)
+          else:
+              head = api('GET', '/git/ref/heads/gh-pages')['object']['sha']
+              backup = 'backup/pre-reviewed-20260915-' + head[:10]
+              api('POST', '/git/refs', {'ref': 'refs/heads/' + backup, 'sha': head})
+              check = api('GET', '/contents/index.html?ref=gh-pages')
+              assert check['sha'] == old_sha, 'Concurrent index change; refusing overwrite'
+              result = api('PUT', '/contents/index.html', {'branch': 'gh-pages', 'message': 'Publish exact reviewed redesign; organization-only destination', 'sha': old_sha, 'content': base64.b64encode(content).decode()})
+              assert result['content']['sha'] == desired_blob, 'GitHub content digest mismatch'
+              readback = api('GET', '/contents/index.html?ref=gh-pages')
+              assert hashlib.sha256(base64.b64decode(readback['content'])).hexdigest() == expected, 'Published readback mismatch'
+              print('PUBLISHED', repo, result['commit']['sha'], 'BACKUP', backup, 'SHA256', expected)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Exact reviewed HTML verified and written for {repo}. SHA256: `{expected}`. Public source contains 90 reviewed files. No AI generation, other repository writes, sheet edits or outreach. A connector release-marker commit is still required to trigger Pages.\n')
